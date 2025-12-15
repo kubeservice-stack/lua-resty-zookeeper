@@ -1,7 +1,7 @@
 package = "lua-resty-zookeeper"
 version = "0.2-3"
 source = {
-  url = "https://github.com/kubeservice-stack/lua-resty-zookeeper",
+  url = "git://github.com/kubeservice-stack/lua-resty-zookeeper",
   tag = "v0.2.3"
 }
 description = {
