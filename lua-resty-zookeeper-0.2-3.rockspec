@@ -1,8 +1,8 @@
 package = "lua-resty-zookeeper"
 version = "0.2-3"
 source = {
-  url = "https://github.com/kubeservice-stack/lua-resty-zookeeper/blob/master/README.md",
-  tag = "none"
+  url = "https://github.com/kubeservice-stack/lua-resty-zookeeper",
+  tag = "v0.2.3"
 }
 description = {
   summary = "Minimal ZooKeeper client for OpenResty / ngx_lua (example)",
