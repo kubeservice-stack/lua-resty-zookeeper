@@ -1,5 +1,5 @@
 package = "lua-resty-zookeeper"
-version = "0.1-1"
+version = "0.2-3"
 source = {
   url = "https://github.com/kubeservice-stack/lua-resty-zookeeper/blob/master/README.md",
   tag = "none"

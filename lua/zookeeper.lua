@@ -8,21 +8,34 @@
 --  - This client is synchronous: it assumes one-request-at-a-time per connection.
 --    Concurrent usage from multiple coroutines requires external synchronization.
 --  - It avoids FFI and uses pure-Lua big-endian packing/unpacking for portability.
+--
+-- Minimal ZooKeeper client for OpenResty / plain Lua
+-- Robust CONNECT handshake parsing with fallback heuristics.
 
 local ngx = ngx
-local socket = ngx and ngx.socket or require("socket") -- fallback for non-nginx Lua (not tested)
-local cjson = require("cjson.safe")
+local socket = ngx and ngx.socket or require("socket") -- fallback for plain Lua (luasocket)
+
+-- safe cjson loading with fallback stub
+local cjson_ok, cjson = pcall(require, "cjson.safe")
+if not cjson_ok then
+    cjson_ok, cjson = pcall(require, "cjson")
+end
+if not cjson_ok or not cjson then
+    cjson = {
+        encode = function(_) return nil, "cjson not available" end,
+        decode = function(_) return nil, "cjson not available" end,
+    }
+end
 
 local _M = {
-    _VERSION = "0.2.0",
+    _VERSION = "0.2.3",
     ZOO_OPEN_ACL_UNSAFE = { { perms = 0x1f, scheme = "world", id = "anyone" } },
 }
 
 local mt = { __index = _M }
 
--- ZK opcodes (wire values are 32-bit signed ints)
 local OP_CODES = {
-    CONNECT = -100,  -- not used in wire header for initial handshake (special-case)
+    CONNECT = -100,
     CREATE = 1,
     DELETE = 2,
     EXISTS = 3,
@@ -39,7 +52,7 @@ local SESSION_STATES = {
     EXPIRED = 2,
 }
 
--- Utilities: pack/unpack big-endian integers (pure Lua, no ffi)
+-- Utilities: big-endian pack/unpack (pure Lua)
 local function uint32_to_be(num)
     num = (num % 4294967296)
     local b1 = math.floor(num / 16777216) % 256
@@ -61,7 +74,6 @@ local function be_to_uint32(s, offset)
     return b1 * 16777216 + b2 * 65536 + b3 * 256 + b4
 end
 
--- Pack two uint32s as 8-byte big-endian (useful for int64 fields)
 local function uint64_parts_to_be(high, low)
     high = (high or 0) % 4294967296
     low = (low or 0) % 4294967296
@@ -77,13 +89,11 @@ local function be_to_uint64_parts(s, offset)
     return hi, lo
 end
 
--- Serialize a length-prefixed string (int32 length BE + bytes)
 local function serialize_string(str)
     str = str or ""
     return uint32_to_be(#str) .. str
 end
 
--- Deserialize length-prefixed string from s at offset, returns str, new_offset
 local function deserialize_string(s, offset)
     offset = offset or 1
     local len, err = be_to_uint32(s, offset)
@@ -97,9 +107,6 @@ local function deserialize_string(s, offset)
     return str, end_pos + 1
 end
 
--- Read a full ZK packet from socket:
---  - first read 4 bytes (length), then read that many bytes (payload)
--- Returns payload (without the 4-byte length) or nil, err
 local function read_packet(sock)
     local len_data, err = sock:receive(4)
     if not len_data then
@@ -119,21 +126,14 @@ local function read_packet(sock)
     return payload, nil
 end
 
--- Serialize request header for normal requests (xid + opcode) and return header string
--- Note: length prefix (4 bytes) is added by caller as uint32_be(total_payload_len)
 local function serialize_request_header(opcode, xid, payload_len)
-    -- total payload for server = xid(4) + opcode(4) + payload_len
     local total_len = 4 + 4 + (payload_len or 0)
     local len_bin = uint32_to_be(total_len)
-    -- xid/opcode are 32-bit signed integers on wire; we encode as uint32 bit pattern
     local xid_bin = uint32_to_be(xid)
     local opcode_bin = uint32_to_be(opcode)
     return len_bin .. xid_bin .. opcode_bin
 end
 
--- Deserialize a normal response (payload from read_packet)
--- Response payload layout: xid(4) + zxid(8) + err(4) + payload...
--- Returns table { xid=..., zxid_hi=..., zxid_lo=..., err=..., payload=... }
 local function deserialize_response(payload)
     if #payload < 16 then
         return nil, "response too short"
@@ -151,57 +151,183 @@ local function deserialize_response(payload)
     }, nil
 end
 
--- Deserialize connect handshake response (payload from read_packet)
--- Response layout: sessionId (8) + passwd(len+bytes) + timeout (4)
-local function deserialize_connect_response(payload)
-    -- Need at least sessionId(8) + passwdLen(4) + timeout(4) => 16 bytes minimum (passwd may be 0)
-    if #payload < 16 then
-        return nil, "connect response too short"
-    end
-    local sid_hi, sid_lo = be_to_uint64_parts(payload, 1)
-    local offset = 9
-    local passwd, new_offset, err = deserialize_string(payload, offset)
-    if not passwd and passwd ~= "" then
-        return nil, "failed parse passwd: " .. (err or "")
-    end
-    local timeout_off = new_offset
-    if #payload < timeout_off + 3 then
-        return nil, "connect response missing timeout"
-    end
-    local timeout = be_to_uint32(payload, timeout_off)
-    -- Compute numeric session id where possible (may fit into Lua number)
-    local session_id_num = nil
-    -- session id = sid_hi * 2^32 + sid_lo; may exceed 53-bit precision for very large values
-    local numeric = sid_hi * 4294967296 + sid_lo
-    if numeric < 9007199254740992 then -- 2^53
-        session_id_num = numeric
-    end
-    return {
-        sid_hi = sid_hi,
-        sid_lo = sid_lo,
-        session_id = session_id_num, -- may be nil if too big
-        session_id_raw = uint64_parts_to_be(sid_hi, sid_lo),
-        passwd = passwd or "",
-        timeout = timeout,
-    }, nil
+local function to_hex(s)
+    return (s:gsub('.', function(c) return string.format('%02X', string.byte(c)) end))
 end
 
--- Internal send-request helper (synchronous)
--- Builds header with current xid, sends header+payload, waits for response, returns parsed response
+-- Robust connect response parsing with scanning heuristics
+local function deserialize_connect_response(payload)
+    if not payload or #payload < 8 then
+        return nil, "connect response too short (need >=8 for sessionId), got length=" .. tostring(#payload)
+    end
+
+    -- Attempt 1: assume payload starts with sessionId
+    local sid_hi, sid_lo = be_to_uint64_parts(payload, 1)
+    local function attempt_passwd_then_timeout(base)
+        base = base or 1
+        local passwd_len_off = base + 8
+        if #payload < passwd_len_off + 3 + 4 then
+            return nil, "not enough bytes to contain passwd length + timeout"
+        end
+        local passwd_len, err = be_to_uint32(payload, passwd_len_off)
+        if not passwd_len then return nil, "failed read passwd length: " .. tostring(err) end
+        local passwd_start = passwd_len_off + 4
+        local passwd_end = passwd_start + passwd_len - 1
+        if #payload < passwd_end + 4 then
+            return nil, string.format("not enough bytes for passwd (need %d, have %d) and timeout", passwd_len, #payload - (passwd_start - 1))
+        end
+        local passwd = passwd_len > 0 and payload:sub(passwd_start, passwd_end) or ""
+        local timeout = be_to_uint32(payload, passwd_end + 1)
+        if not timeout then return nil, "failed read timeout after passwd" end
+        local numeric = sid_hi * 4294967296 + sid_lo
+        return {
+            sid_hi = sid_hi,
+            sid_lo = sid_lo,
+            session_id = numeric < 9007199254740992 and numeric or nil,
+            session_id_raw = uint64_parts_to_be(sid_hi, sid_lo),
+            passwd = passwd,
+            timeout = timeout,
+        }, nil
+    end
+
+    local function attempt_timeout_then_passwd(base)
+        base = base or 1
+        local timeout_off = base + 8
+        if #payload < timeout_off + 3 + 4 then
+            return nil, "not enough bytes to contain timeout + passwd length"
+        end
+        local timeout = be_to_uint32(payload, timeout_off)
+        if not timeout then return nil, "failed read timeout at offset " .. tostring(timeout_off) end
+        local passwd_len_off = timeout_off + 4
+        if #payload < passwd_len_off + 3 then
+            if #payload == passwd_len_off - 1 then
+                local numeric = sid_hi * 4294967296 + sid_lo
+                return {
+                    sid_hi = sid_hi,
+                    sid_lo = sid_lo,
+                    session_id = numeric < 9007199254740992 and numeric or nil,
+                    session_id_raw = uint64_parts_to_be(sid_hi, sid_lo),
+                    passwd = "",
+                    timeout = timeout,
+                }, nil
+            end
+            return nil, "not enough bytes for passwd length after timeout"
+        end
+        local passwd_len = be_to_uint32(payload, passwd_len_off)
+        if not passwd_len then return nil, "failed read passwd length after timeout" end
+        local passwd_start = passwd_len_off + 4
+        local passwd_end = passwd_start + passwd_len - 1
+        if #payload < passwd_end then
+            return nil, string.format("not enough bytes for passwd (need %d, have %d)", passwd_len, #payload - (passwd_start - 1))
+        end
+        local passwd = passwd_len > 0 and payload:sub(passwd_start, passwd_end) or ""
+        local numeric = sid_hi * 4294967296 + sid_lo
+        return {
+            sid_hi = sid_hi,
+            sid_lo = sid_lo,
+            session_id = numeric < 9007199254740992 and numeric or nil,
+            session_id_raw = uint64_parts_to_be(sid_hi, sid_lo),
+            passwd = passwd,
+            timeout = timeout,
+        }, nil
+    end
+
+    -- Try standard parses with sessionId at offset 1
+    local res, err = attempt_passwd_then_timeout(1)
+    if res then return res, nil end
+    local res2, err2 = attempt_timeout_then_passwd(1)
+    if res2 then return res2, nil end
+
+    -- If payload may be wrapped (e.g. normal response header present), try user-payload at offset 17
+    if #payload >= 16 then
+        local user_payload = payload:sub(17)
+        if #user_payload >= 8 then
+            -- try parsing user_payload directly as sessionId-starting handshake
+            local up_sid_hi, up_sid_lo = be_to_uint64_parts(user_payload, 1)
+            -- temporarily override sid_hi/lo for attempts
+            sid_hi, sid_lo = up_sid_hi, up_sid_lo
+            local r3, e3 = attempt_passwd_then_timeout(1)
+            if r3 then return r3, nil end
+            local r4, e4 = attempt_timeout_then_passwd(1)
+            if r4 then return r4, nil end
+            -- restore original sid_hi/sid_lo for further attempts
+            sid_hi, sid_lo = be_to_uint64_parts(payload, 1)
+        end
+    end
+
+    -- Scanning heuristic:
+    -- Search for any 4-byte value L (0 <= L <= 4096) such that L fits as passwd length
+    -- (i.e., payload contains 4 bytes L followed by L bytes); then try to locate timeout and sessionId near it.
+    local max_passwd_len = 4096
+    local plen = #payload
+    for i = 1, plen - 4 do
+        local possible_len, _ = be_to_uint32(payload, i)
+        if possible_len and possible_len >= 0 and possible_len <= max_passwd_len then
+            local passwd_start = i + 4
+            local passwd_end = passwd_start + possible_len - 1
+            if passwd_end <= plen then
+                -- try to find timeout either immediately after passwd, or just before the length field
+                local timeout = nil
+                if passwd_end + 4 <= plen then
+                    timeout = be_to_uint32(payload, passwd_end + 1)
+                elseif i - 4 >= 1 then
+                    timeout = be_to_uint32(payload, i - 4)
+                end
+                -- try to pick sessionId: look for 8 bytes before the timeout or before length field
+                local sid_candidate_off = nil
+                if timeout then
+                    -- prefer 8 bytes before the timeout field offset
+                    local timeout_off = (passwd_end + 1 <= plen) and (passwd_end + 1) or (i - 4)
+                    local cand_end = timeout_off - 1
+                    local cand_start = cand_end - 7
+                    if cand_start >= 1 then
+                        sid_candidate_off = cand_start
+                    end
+                end
+                if not sid_candidate_off then
+                    -- fallback: take first 8 bytes of payload if available
+                    if plen >= 8 then sid_candidate_off = 1 end
+                end
+                if sid_candidate_off then
+                    local s_hi, s_lo = be_to_uint64_parts(payload, sid_candidate_off)
+                    if s_hi and s_lo then
+                        local numeric = s_hi * 4294967296 + s_lo
+                        -- basic plausibility: numeric >= 0
+                        local passwd = possible_len > 0 and payload:sub(passwd_start, passwd_end) or ""
+                        return {
+                            sid_hi = s_hi,
+                            sid_lo = s_lo,
+                            session_id = numeric < 9007199254740992 and numeric or nil,
+                            session_id_raw = uint64_parts_to_be(s_hi, s_lo),
+                            passwd = passwd,
+                            timeout = timeout or 0,
+                        }, nil
+                    end
+                end
+            end
+        end
+    end
+
+    -- Give up with detailed debug info
+    local hexpayload = to_hex(payload)
+    local msg = "failed parse connect response; attempts:\n" ..
+                "  passwd-then-timeout error: " .. tostring(err) .. "\n" ..
+                "  timeout-then-passwd error: " .. tostring(err2) .. "\n" ..
+                "payload length: " .. tostring(#payload) .. "\n" ..
+                "payload hex: " .. hexpayload
+    return nil, msg
+end
+
 local function send_request(self, opcode, payload)
     payload = payload or ""
     local xid = self.xid
-    -- encode header
     local header = serialize_request_header(opcode, xid, #payload)
     local req = header .. payload
-    -- send
     local bytes, err = self.sock:send(req)
     if not bytes then
         return nil, "send failed: " .. (err or "unknown")
     end
-    -- increment xid for next request
     self.xid = (self.xid + 1) % 4294967296
-    -- receive
     local raw_payload, err2 = read_packet(self.sock)
     if not raw_payload then
         return nil, "receive failed: " .. (err2 or "unknown")
@@ -210,23 +336,22 @@ local function send_request(self, opcode, payload)
     if not res then
         return nil, "deserialize response failed: " .. (err3 or "unknown")
     end
-    -- Optionally check xid match (server echoes xid)
     if res.xid ~= xid then
-        -- xid can be interpreted as unsigned; we compare bit patterns via modulo 2^32
-        -- best-effort warning, but continue returning result
-        ngx.log and ngx.log(ngx.WARN, "zk: xid mismatch: sent=", xid, " got=", res.xid)
+        if ngx and ngx.log then
+            ngx.log(ngx.WARN, "zk: xid mismatch: sent=", xid, " got=", res.xid)
+        else
+            io.stderr:write(string.format("zk: xid mismatch: sent=%s got=%s\n", tostring(xid), tostring(res.xid)))
+        end
     end
     return res, nil
 end
 
--- API: new()
 function _M.new(opts)
     opts = opts or {}
     local sock, err
     if ngx and ngx.socket then
         sock = ngx.socket.tcp()
     else
-        -- fallback for non-openresty (blocking socket from luasocket) -- not fully tested
         sock, err = socket.tcp()
         if not sock then
             return nil, "socket.tcp failed: " .. (err or "")
@@ -235,17 +360,17 @@ function _M.new(opts)
 
     local self = {
         sock = sock,
-        timeout = opts.timeout or 3000, -- ms for ngx, seconds for luasocket fallback
+        timeout = opts.timeout or 3000,
         session_state = SESSION_STATES.DISCONNECTED,
         session_id = 0,
         session_passwd = "",
         connect_string = opts.connect_string or "127.0.0.1:2181",
-        session_timeout = opts.session_timeout or 30000, -- ms
-        xid = 1, -- start xid (0,1,2...). -1 used only for connect handshake (special-case)
+        session_timeout = opts.session_timeout or 30000,
+        xid = 1,
         auth = nil,
+        debug = opts.debug or false,
     }
 
-    -- set timeout on socket (ngx.socket.tcp uses milliseconds)
     if ngx and ngx.socket then
         self.sock:settimeout(self.timeout)
     else
@@ -264,8 +389,6 @@ function _M.set_timeout(self, timeout)
     end
 end
 
--- Connect to first node in connect_string (comma-separated host:port)
--- Performs proper ZooKeeper handshake (no xid/opcode header)
 function _M.connect(self, connect_string, session_timeout)
     self.connect_string = connect_string or self.connect_string
     self.session_timeout = session_timeout or self.session_timeout
@@ -279,75 +402,84 @@ function _M.connect(self, connect_string, session_timeout)
     end
 
     local nodes = split(self.connect_string, ",")
-    if #nodes == 0 then
-        return nil, "empty connect string"
-    end
+    if #nodes == 0 then return nil, "empty connect string" end
 
     local first = nodes[1]
     local parts = split(first, ":")
     local host = parts[1]
     local port = tonumber(parts[2]) or 2181
-    if not host then
-        return nil, "invalid node: " .. tostring(first)
-    end
+    if not host then return nil, "invalid node: " .. tostring(first) end
 
     local ok, err = self.sock:connect(host, port)
-    if not ok then
-        return nil, "connect failed: " .. (err or "unknown")
-    end
-    -- ensure timeout set
+    if not ok then return nil, "connect failed: " .. (err or "unknown") end
+
     if ngx and ngx.socket then
         self.sock:settimeout(self.timeout)
     else
         pcall(function() self.sock:settimeout(self.timeout / 1000) end)
     end
 
-    -- Build handshake payload:
-    -- protocolVersion(int32) + lastZxidSeen(int64) + timeout(int32) + sessionId(int64) + passwd(len+bytes)
-    -- Protocol version: use 0 (legacy) or 28/29 for newer clients; 0 is widely accepted
     local protocol_version = 0
     local last_zxid_hi, last_zxid_lo = 0, 0
     local timeout_ms = self.session_timeout
-    -- sessionId left as 0 for new session
     local sid_hi, sid_lo = 0, 0
     local passwd = ""
 
-    local payload = {}
-    table.insert(payload, uint32_to_be(protocol_version))
-    table.insert(payload, uint64_parts_to_be(last_zxid_hi, last_zxid_lo))
-    table.insert(payload, uint32_to_be(timeout_ms))
-    table.insert(payload, uint64_parts_to_be(sid_hi, sid_lo))
-    table.insert(payload, serialize_string(passwd))
-
+    local payload = {
+        uint32_to_be(protocol_version),
+        uint64_parts_to_be(last_zxid_hi, last_zxid_lo),
+        uint32_to_be(timeout_ms),
+        uint64_parts_to_be(sid_hi, sid_lo),
+        serialize_string(passwd),
+    }
     local payload_str = table.concat(payload)
-    -- Prepend 4-byte length (of payload only) as BE uint32
     local req = uint32_to_be(#payload_str) .. payload_str
 
-    local bytes, err = self.sock:send(req)
+    local bytes, send_err = self.sock:send(req)
     if not bytes then
         pcall(function() self.sock:close() end)
-        return nil, "send handshake failed: " .. (err or "unknown")
+        return nil, "send handshake failed: " .. (send_err or "unknown")
     end
 
-    -- read handshake response payload
-    local payload_recv, err = read_packet(self.sock)
+    local payload_recv, rerr = read_packet(self.sock)
     if not payload_recv then
         pcall(function() self.sock:close() end)
-        return nil, "receive handshake failed: " .. (err or "unknown")
+        return nil, "receive handshake failed: " .. (rerr or "unknown")
     end
 
-    local conn_res, err = deserialize_connect_response(payload_recv)
+    if self.debug then
+        local h = to_hex(payload_recv)
+        if ngx and ngx.log then
+            ngx.log(ngx.DEBUG, "zk: handshake payload len=", #payload_recv)
+            ngx.log(ngx.DEBUG, "zk: handshake payload hex=", h)
+        else
+            print("zk: handshake payload len=", #payload_recv)
+            print("zk: handshake payload hex=", h)
+        end
+    end
+
+    local conn_res, derr = deserialize_connect_response(payload_recv)
+    if not conn_res and #payload_recv >= 16 then
+        -- try parsing user payload (strip standard response header)
+        local user_payload = payload_recv:sub(17)
+        local cr2, derr2 = deserialize_connect_response(user_payload)
+        if cr2 then
+            conn_res = cr2
+            derr = nil
+        else
+            if derr then derr = derr .. "\nwrapped-attempt: " .. tostring(derr2) end
+        end
+    end
+
     if not conn_res then
         pcall(function() self.sock:close() end)
-        return nil, "invalid connect response: " .. (err or "unknown")
+        return nil, "invalid connect response: " .. (derr or "unknown")
     end
 
-    -- store session info
     if conn_res.session_id then
         self.session_id = conn_res.session_id
     else
-        -- fallback to store raw parts as string
-        self.session_id = conn_res.sid_hi .. ":" .. conn_res.sid_lo
+        self.session_id = tostring(conn_res.sid_hi) .. ":" .. tostring(conn_res.sid_lo)
     end
     self.session_passwd = conn_res.passwd or ""
     self.session_timeout = conn_res.timeout or self.session_timeout
@@ -356,88 +488,55 @@ function _M.connect(self, connect_string, session_timeout)
     return true, nil
 end
 
--- add_auth(auth_scheme, creds)
 function _M.add_auth(self, auth_type, creds)
-    if self.session_state ~= SESSION_STATES.CONNECTED then
-        return nil, "not connected"
-    end
+    if self.session_state ~= SESSION_STATES.CONNECTED then return nil, "not connected" end
     local payload = serialize_string(auth_type) .. serialize_string(creds)
     local res, err = send_request(self, OP_CODES.AUTH, payload)
-    if not res then
-        return nil, err
-    end
-    if res.err ~= 0 then
-        return nil, "auth failed, err=" .. tostring(res.err)
-    end
+    if not res then return nil, err end
+    if res.err ~= 0 then return nil, "auth failed, err=" .. tostring(res.err) end
     self.auth = { type = auth_type, creds = creds }
     return true, nil
 end
 
--- exists(path) -> returns true/false or nil, err
 function _M.exists(self, path)
-    if self.session_state ~= SESSION_STATES.CONNECTED then
-        return nil, "not connected"
-    end
-    -- exists payload: path(string) [watch(boolean) as int32]. We'll set watch=0
+    if self.session_state ~= SESSION_STATES.CONNECTED then return nil, "not connected" end
     local payload = serialize_string(path) .. uint32_to_be(0)
     local res, err = send_request(self, OP_CODES.EXISTS, payload)
     if not res then return nil, err end
     if res.err ~= 0 then
-        -- ZooKeeper error codes: 2 = NoNode, etc. We just return false for NoNode (2).
-        if res.err == 2 then
-            return false, nil
-        end
+        if res.err == 2 then return false, nil end
         return nil, "zk error code: " .. tostring(res.err)
     end
-    -- payload contains stat structure; if non-empty node exists
-    if res.payload and #res.payload > 0 then
-        return true, nil
-    end
+    if res.payload and #res.payload > 0 then return true, nil end
     return false, nil
 end
 
--- get_data(path) -> returns data_string or nil, err
 function _M.get_data(self, path)
-    if self.session_state ~= SESSION_STATES.CONNECTED then
-        return nil, "not connected"
-    end
-    -- getData payload: path(string) + watch(int32) (we'll set 0)
+    if self.session_state ~= SESSION_STATES.CONNECTED then return nil, "not connected" end
     local payload = serialize_string(path) .. uint32_to_be(0)
     local res, err = send_request(self, OP_CODES.GET_DATA, payload)
     if not res then return nil, err end
     if res.err ~= 0 then
-        if res.err == 2 then
-            return nil, "node does not exist"
-        end
+        if res.err == 2 then return nil, "node does not exist" end
         return nil, "zk error code: " .. tostring(res.err)
     end
-    -- payload: data (string) + stat(...) ; we need to parse data string first
-    local data, off, err = deserialize_string(res.payload, 1)
-    if not data and data ~= "" then
-        return nil, "failed parse data: " .. (err or "unknown")
-    end
+    local data, off, derr = deserialize_string(res.payload, 1)
+    if not data and data ~= "" then return nil, "failed parse data: " .. (derr or "unknown") end
     return data, nil
 end
 
--- close connection (cleanly)
 function _M.close(self)
-    if self.session_state == SESSION_STATES.DISCONNECTED then
-        return true, nil
-    end
-    -- It's sufficient to close the socket to inform server
+    if self.session_state == SESSION_STATES.DISCONNECTED then return true, nil end
     local ok, err = pcall(function() return self.sock:close() end)
-    -- pcall returns (true, result) on success; handle accordingly
     if ok then
         self.session_state = SESSION_STATES.DISCONNECTED
         return true, nil
     else
-        -- ok==false, err is error message
         self.session_state = SESSION_STATES.DISCONNECTED
         return nil, "close failed: " .. tostring(err)
     end
 end
 
--- Simple helper to pretty-print for debugging (careful with secrets)
 function _M._debug(self)
     return {
         session_state = self.session_state,

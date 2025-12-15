@@ -5,7 +5,7 @@
 --   lua test/test_zk.lua 127.0.0.1:2181 /
 --
 -- Requirements:
---   - Lua (5.1/5.2/5.3)
+--   - Lua (5.1/5.2/5.3/5.4)
 --   - LuaSocket (`luarocks install luasocket`)
 --   - cjson (optional; module requires cjson.safe. If not present, the client may still work but will error on require)
 --
@@ -28,6 +28,7 @@ local client, err = zk.new{
     timeout = 5000,            -- milliseconds (used by ngx.socket) or best-effort for LuaSocket fallback
     connect_string = connect_string,
     session_timeout = 30000,
+    debug = true,
 }
 
 if not client then

@@ -1,4 +1,4 @@
-# lua-resty-zookeeper (example)
+# lua-resty-zookeeper
 
 A minimal example ZooKeeper client for OpenResty / ngx_lua and plain Lua.  
 This project provides:
