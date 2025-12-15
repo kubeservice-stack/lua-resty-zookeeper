@@ -3,7 +3,7 @@
 A minimal example ZooKeeper client for OpenResty / ngx_lua and plain Lua.  
 This project provides:
 
-- `lua/zk_connection.lua` — the core minimal client (handshake + basic ops).
+- `lua/zookeeper.lua` — the core minimal client (handshake + basic ops).
 - `lua/resty/zookeeper.lua` — wrapper for OpenResty (`require("resty.zookeeper")`).
 - `test/test_zk.lua` — a simple test script runnable with Lua + LuaSocket.
 
@@ -20,7 +20,7 @@ Quick start (plain Lua)
    lua test/test_zk.lua 127.0.0.1:2181 /
 
 Quick start (OpenResty)
-1. Put `lua/zk_connection.lua` and `lua/resty/zookeeper.lua` on your `lua_package_path`.
+1. Put `lua/zookeeper.lua` and `lua/resty/zookeeper.lua` on your `lua_package_path`.
 2. In Lua code running in OpenResty:
    local zk = require("resty.zookeeper")
    local client, err = zk.new{ connect_string = "127.0.0.1:2181" }
