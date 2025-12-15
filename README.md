@@ -15,17 +15,23 @@ Important notes
 
 Quick start (plain Lua)
 1. Install Lua and LuaSocket:
+```
    luarocks install luasocket
+```
 2. From project root run:
+```
    lua test/test_zk.lua 127.0.0.1:2181 /
+```
 
 Quick start (OpenResty)
 1. Put `lua/zookeeper.lua` and `lua/resty/zookeeper.lua` on your `lua_package_path`.
 2. In Lua code running in OpenResty:
+```
    local zk = require("resty.zookeeper")
    local client, err = zk.new{ connect_string = "127.0.0.1:2181" }
    client:connect()
    local exists = client:exists("/")
+```
 
 Development & Tests
 - The `test/test_zk.lua` is a minimal smoke test. For real testing, add unit tests and integration tests against a local ZK server.
