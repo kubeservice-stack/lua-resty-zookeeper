@@ -28,7 +28,7 @@ if not cjson_ok or not cjson then
 end
 
 local _M = {
-    _VERSION = "0.2.4",
+    _VERSION = "0.2.5",
     ZOO_OPEN_ACL_UNSAFE = { { perms = 0x1f, scheme = "world", id = "anyone" } },
 }
 
@@ -135,13 +135,23 @@ local function serialize_request_header(opcode, xid, payload_len)
     return len_bin .. xid_bin .. opcode_bin
 end
 
+-- convert unsigned 32-bit to signed 32-bit
+local function to_signed32(n)
+    if not n then return nil end
+    if n >= 2147483648 then
+        return n - 4294967296
+    end
+    return n
+end
+
 local function deserialize_response(payload)
     if #payload < 16 then
         return nil, "response too short"
     end
     local xid, _ = be_to_uint32(payload, 1)
     local zxid_hi, zxid_lo = be_to_uint64_parts(payload, 5)
-    local err_code, _ = be_to_uint32(payload, 13)
+    local err_u, _ = be_to_uint32(payload, 13)
+    local err_code = to_signed32(err_u)
     local user_payload = payload:sub(17)
     return {
         xid = xid,
@@ -243,22 +253,17 @@ local function deserialize_connect_response(payload)
     if #payload >= 16 then
         local user_payload = payload:sub(17)
         if #user_payload >= 8 then
-            -- try parsing user_payload directly as sessionId-starting handshake
             local up_sid_hi, up_sid_lo = be_to_uint64_parts(user_payload, 1)
-            -- temporarily override sid_hi/lo for attempts
             sid_hi, sid_lo = up_sid_hi, up_sid_lo
             local r3, e3 = attempt_passwd_then_timeout(1)
             if r3 then return r3, nil end
             local r4, e4 = attempt_timeout_then_passwd(1)
             if r4 then return r4, nil end
-            -- restore original sid_hi/sid_lo for further attempts
             sid_hi, sid_lo = be_to_uint64_parts(payload, 1)
         end
     end
 
     -- Scanning heuristic:
-    -- Search for any 4-byte value L (0 <= L <= 4096) such that L fits as passwd length
-    -- (i.e., payload contains 4 bytes L followed by L bytes); then try to locate timeout and sessionId near it.
     local max_passwd_len = 4096
     local plen = #payload
     for i = 1, plen - 4 do
@@ -267,17 +272,14 @@ local function deserialize_connect_response(payload)
             local passwd_start = i + 4
             local passwd_end = passwd_start + possible_len - 1
             if passwd_end <= plen then
-                -- try to find timeout either immediately after passwd, or just before the length field
                 local timeout = nil
                 if passwd_end + 4 <= plen then
                     timeout = be_to_uint32(payload, passwd_end + 1)
                 elseif i - 4 >= 1 then
                     timeout = be_to_uint32(payload, i - 4)
                 end
-                -- try to pick sessionId: look for 8 bytes before the timeout or before length field
                 local sid_candidate_off = nil
                 if timeout then
-                    -- prefer 8 bytes before the timeout field offset
                     local timeout_off = (passwd_end + 1 <= plen) and (passwd_end + 1) or (i - 4)
                     local cand_end = timeout_off - 1
                     local cand_start = cand_end - 7
@@ -286,14 +288,12 @@ local function deserialize_connect_response(payload)
                     end
                 end
                 if not sid_candidate_off then
-                    -- fallback: take first 8 bytes of payload if available
                     if plen >= 8 then sid_candidate_off = 1 end
                 end
                 if sid_candidate_off then
                     local s_hi, s_lo = be_to_uint64_parts(payload, sid_candidate_off)
                     if s_hi and s_lo then
                         local numeric = s_hi * 4294967296 + s_lo
-                        -- basic plausibility: numeric >= 0
                         local passwd = possible_len > 0 and payload:sub(passwd_start, passwd_end) or ""
                         return {
                             sid_hi = s_hi,
@@ -309,7 +309,6 @@ local function deserialize_connect_response(payload)
         end
     end
 
-    -- Give up with detailed debug info
     local hexpayload = to_hex(payload)
     local msg = "failed parse connect response; attempts:\n" ..
                 "  passwd-then-timeout error: " .. tostring(err) .. "\n" ..
@@ -474,7 +473,6 @@ function _M.connect(self, connect_string, session_timeout)
 
     local conn_res, derr = deserialize_connect_response(payload_recv)
     if not conn_res and #payload_recv >= 16 then
-        -- try parsing user payload (strip standard response header)
         local user_payload = payload_recv:sub(17)
         local cr2, derr2 = deserialize_connect_response(user_payload)
         if cr2 then
@@ -518,7 +516,9 @@ function _M.exists(self, path)
     local res, err = send_request(self, OP_CODES.EXISTS, payload)
     if not res then return nil, err end
     if res.err ~= 0 then
-        if res.err == 2 then return false, nil end
+        if res.err == -101 then -- ZNONODE
+            return false, nil
+        end
         return nil, "zk error code: " .. tostring(res.err)
     end
     if res.payload and #res.payload > 0 then return true, nil end
@@ -531,11 +531,13 @@ function _M.get_data(self, path)
     local res, err = send_request(self, OP_CODES.GET_DATA, payload)
     if not res then return nil, err end
     if res.err ~= 0 then
-        if res.err == 2 then return nil, "node does not exist" end
+        if res.err == -101 then -- ZNONODE
+            return nil, "node does not exist"
+        end
         return nil, "zk error code: " .. tostring(res.err)
     end
     local data, off, derr = deserialize_string(res.payload, 1)
-    if data == nil and data ~= "" then return nil, "failed parse data: " .. (derr or "unknown") end
+    if data == nil then return nil, "failed parse data: " .. (derr or "unknown") end
     return data, nil
 end
 
@@ -567,11 +569,17 @@ function _M.create(self, path, data, mode, sequential)
     local res, err = send_request(self, OP_CODES.CREATE, payload)
     if not res then return nil, err end
     if res.err ~= 0 then
+        if res.err == -101 then
+            return nil, "parent node does not exist"
+        end
+        if res.err == -110 then -- ZNODEEXISTS
+            return nil, "node already exists"
+        end
         return nil, "zk error code: " .. tostring(res.err)
     end
     -- payload contains created path (string)
     local created, off, derr = deserialize_string(res.payload, 1)
-    if not created and created ~= "" then
+    if created == nil then
         return nil, "failed parse created path: " .. (derr or "unknown")
     end
     return created, nil
@@ -584,7 +592,9 @@ function _M.get_children(self, path)
     local res, err = send_request(self, OP_CODES.GET_CHILDREN, payload)
     if not res then return nil, err end
     if res.err ~= 0 then
-        if res.err == 2 then return nil, "node does not exist" end
+        if res.err == -101 then -- ZNONODE
+            return nil, "node does not exist"
+        end
         return nil, "zk error code: " .. tostring(res.err)
     end
     local children = {}
