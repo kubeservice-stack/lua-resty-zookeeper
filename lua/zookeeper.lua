@@ -28,7 +28,7 @@ if not cjson_ok or not cjson then
 end
 
 local _M = {
-    _VERSION = "0.2.3",
+    _VERSION = "0.2.4",
     ZOO_OPEN_ACL_UNSAFE = { { perms = 0x1f, scheme = "world", id = "anyone" } },
 }
 
@@ -44,6 +44,7 @@ local OP_CODES = {
     AUTH = 100,
     CLOSE = -1,
     PING = -101,
+    GET_CHILDREN = 8,
 }
 
 local SESSION_STATES = {
@@ -521,8 +522,33 @@ function _M.get_data(self, path)
         return nil, "zk error code: " .. tostring(res.err)
     end
     local data, off, derr = deserialize_string(res.payload, 1)
-    if not data and data ~= "" then return nil, "failed parse data: " .. (derr or "unknown") end
+    if data == nil and data ~= "" then return nil, "failed parse data: " .. (derr or "unknown") end
     return data, nil
+end
+
+function _M.get_children(self, path)
+    if self.session_state ~= SESSION_STATES.CONNECTED then return nil, "not connected" end
+    local payload = serialize_string(path) .. uint32_to_be(0) -- watch = 0
+    local res, err = send_request(self, OP_CODES.GET_CHILDREN, payload)
+    if not res then return nil, err end
+    if res.err ~= 0 then
+        if res.err == 2 then return nil, "node does not exist" end
+        return nil, "zk error code: " .. tostring(res.err)
+    end
+    local children = {}
+    local offset = 1
+    local count, cerr = be_to_uint32(res.payload, offset)
+    if not count then return nil, "failed parse children count: " .. (cerr or "") end
+    offset = offset + 4
+    for i = 1, count do
+        local child, new_offset, derr = deserialize_string(res.payload, offset)
+        if child == nil then
+            return nil, "failed parse child string: " .. (derr or "")
+        end
+        table.insert(children, child)
+        offset = new_offset
+    end
+    return children, nil
 end
 
 function _M.close(self)
