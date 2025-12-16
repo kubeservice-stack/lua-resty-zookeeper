@@ -347,6 +347,19 @@ local function send_request(self, opcode, payload)
     return res, nil
 end
 
+-- serialize ACL array (count + entries). Each ACL: perms(int32) + scheme(string) + id(string)
+local function serialize_acl_array(acls)
+    local parts = {}
+    parts[#parts + 1] = uint32_to_be(#acls)
+    for _, acl in ipairs(acls) do
+        local perms = acl.perms or acl.perm or 0
+        parts[#parts + 1] = uint32_to_be(perms)
+        parts[#parts + 1] = serialize_string(acl.scheme or acl[1] or "")
+        parts[#parts + 1] = serialize_string(acl.id or acl[2] or "")
+    end
+    return table.concat(parts)
+end
+
 function _M.new(opts)
     opts = opts or {}
     local sock, err
@@ -526,6 +539,45 @@ function _M.get_data(self, path)
     return data, nil
 end
 
+-- create(path, data, mode, sequential)
+-- mode: "persistent" (default) or "ephemeral"
+-- sequential: boolean, if true sets the sequence bit
+-- returns created_path, nil on success
+function _M.create(self, path, data, mode, sequential)
+    if self.session_state ~= SESSION_STATES.CONNECTED then return nil, "not connected" end
+    if not path or type(path) ~= "string" then return nil, "invalid path" end
+    data = data or ""
+    mode = mode or "persistent"
+    sequential = not not sequential
+
+    -- flags: ephemeral = 1, sequence = 2
+    local flags = 0
+    if mode == "ephemeral" or mode == "ephemeral_sequential" then
+        flags = flags + 1
+    end
+    if sequential then
+        flags = flags + 2
+    end
+
+    -- default ACL if none provided
+    local acl = self.ZOO_OPEN_ACL_UNSAFE or _M.ZOO_OPEN_ACL_UNSAFE
+    local acl_bin = serialize_acl_array(acl)
+
+    local payload = serialize_string(path) .. serialize_string(data) .. acl_bin .. uint32_to_be(flags)
+    local res, err = send_request(self, OP_CODES.CREATE, payload)
+    if not res then return nil, err end
+    if res.err ~= 0 then
+        return nil, "zk error code: " .. tostring(res.err)
+    end
+    -- payload contains created path (string)
+    local created, off, derr = deserialize_string(res.payload, 1)
+    if not created and created ~= "" then
+        return nil, "failed parse created path: " .. (derr or "unknown")
+    end
+    return created, nil
+end
+
+-- get_children(path) -> returns table of child names
 function _M.get_children(self, path)
     if self.session_state ~= SESSION_STATES.CONNECTED then return nil, "not connected" end
     local payload = serialize_string(path) .. uint32_to_be(0) -- watch = 0

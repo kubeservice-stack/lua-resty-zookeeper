@@ -25,10 +25,10 @@ local connect_string = arg[1] or "127.0.0.1:2181"
 local test_path = arg[2] or "/"
 
 local client, err = zk.new{
-    timeout = 5000,            -- milliseconds (used by ngx.socket) or best-effort for LuaSocket fallback
+    timeout = 5000,
     connect_string = connect_string,
     session_timeout = 30000,
-    debug = true,
+    debug = true, -- enable to print handshake payload hex for troubleshooting
 }
 
 if not client then
@@ -60,12 +60,53 @@ local data, err = client:get_data(test_path)
 if err then
     print("get_data error for path", test_path, ":", err)
 else
-    -- Print data length and preview (avoid huge dumps)
     local preview = data or ""
     if #preview > 200 then
         preview = preview:sub(1, 200) .. "...(truncated, total " .. #data .. " bytes)"
     end
     print("get_data(", test_path, ") => length:", #data, "preview:", preview)
+end
+
+-- Create a sequential child under test_path
+local parent = test_path
+-- Ensure parent exists (if not, attempt to create as persistent)
+local ex, err = client:exists(parent)
+if ex == false then
+    print("Parent", parent, "does not exist; attempting to create it as persistent")
+    local created_parent, cerr = client:create(parent, "", "persistent", false)
+    if not created_parent then
+        print("failed to create parent:", cerr)
+    else
+        print("created parent:", created_parent)
+    end
+elseif err then
+    print("error checking parent existence:", err)
+end
+
+local child_prefix = parent
+if parent:sub(-1) ~= "/" then
+    child_prefix = parent .. "/node"
+else
+    child_prefix = parent .. "node"
+end
+
+print("Creating sequential child with prefix:", child_prefix)
+local created_path, cerr = client:create(child_prefix, "test-data", "persistent", true)
+if not created_path then
+    print("create failed:", cerr)
+else
+    print("create succeeded, created path:", created_path)
+end
+
+-- List children of parent
+local children, err = client:get_children(parent)
+if err then
+    print("get_children error for", parent, ":", err)
+else
+    print("children of", parent, ":")
+    for i, name in ipairs(children) do
+        print("  ", i, name)
+    end
 end
 
 -- Clean close
