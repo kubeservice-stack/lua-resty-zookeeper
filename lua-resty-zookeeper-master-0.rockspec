@@ -8,7 +8,7 @@ description = {
   summary = "Minimal ZooKeeper client for OpenResty / ngx_lua (example)",
   detailed = "A minimal synchronous ZooKeeper client illustrating handshake and basic ops.",
   homepage = "https://stack.kubeservice.cn/",
-  license = "MIT"
+  license = "BSD"
 }
 dependencies = {
   "lua >= 5.1",
