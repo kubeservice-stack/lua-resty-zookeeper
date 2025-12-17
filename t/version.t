@@ -12,12 +12,14 @@ run_tests();
 __DATA__
 
 === TEST 1: basic
---- global_config eval: $::GlobalConfig
---- server_config
-        content_by_lua '
+--- config
+    location /test_get_node {
+        content_by_lua_block {
             local zk = require "resty.zookeeper"
             ngx.say(zk._VERSION)
-        ';
+        }
+--- request
+GET /test_get_node
 --- response_body_like chop
 ^\d+\.\d+$
 --- no_error_log

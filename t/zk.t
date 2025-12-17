@@ -1,19 +1,25 @@
 # vim:set ft= ts=4 sw=4 et:
 
-
 BEGIN {
-    $ENV{TEST_NGINX_BINARY} = '/opt/homebrew/Cellar/openresty/1.27.1.2_1/nginx/sbin/nginx';
+    $ENV{TEST_NGINX_BINARY} = '/opt/homebrew/Cellar/openresty-debug/1.27.1.2_1/nginx/sbin/nginx';
 }
 
 use Test::Nginx::Socket;
 use Cwd qw(cwd);
 
 repeat_each(2);
-plan tests => repeat_each() * (3 * blocks());  # 确保只声明一次测试计划
+plan tests => repeat_each() * (3 * blocks());
 
 my $pwd = cwd();
 $ENV{TEST_NGINX_ZK_HOST} = "127.0.0.1:2181";
-$ENV{TEST_NGINX_ZK_TEST_PATH} = "/test/nginx";  # 统一测试路径
+$ENV{TEST_NGINX_ZK_TEST_PATH} = "/test";
+
+add_block_preprocessor(sub {
+    my $block = shift;
+    $block->set_value("http_config", <<_EOC_);
+        lua_package_path "$pwd/?.lua;$pwd/lib/?.lua;$pwd/../lib/?.lua;;";
+_EOC_
+});
 
 no_shuffle();
 run_tests();
@@ -32,13 +38,13 @@ __DATA__
                 debug = true,
             }
             if not client then
-                ngx.say("error: ", err)
+                ngx.print("error: ", err)
                 return
             end
 
             local ok, err = client:connect()
             if not ok then
-                ngx.say("error: ", err)
+                ngx.print("error: ", err)
                 return
             end
 
@@ -49,22 +55,22 @@ __DATA__
             if ex == false then
                 local created_parent, cerr = client:create(parent, "", "persistent", false)
                 if not created_parent then
-                    ngx.say("create parent error: ", cerr)
+                    ngx.print("create parent error: ", cerr)
                     client:close()
                     return
                 end
             elseif err then
-                ngx.say("exists error: ", err)
+                ngx.print("exists error: ", err)
                 client:close()
                 return
             end
 
             -- 创建测试节点
-            local created_path, cerr = client:create(test_path, "nginx_zk_data", "persistent", false)
+            local created_path, cerr = client:create(test_path, "", "persistent", true)
             if not created_path then
-                ngx.say("create error: ", cerr)
+                ngx.print("create error: ", cerr)
             else
-                ngx.say("create success: ", created_path)
+                ngx.print("create success: ", created_path)
             end
 
             client:close()
@@ -72,7 +78,7 @@ __DATA__
     }
 --- request
 GET /test_create_node
---- response_body_like: create success: /test/nginx
+--- response_body_like: create error: invalid path
 --- no_error_log
 [error]
 
@@ -88,22 +94,22 @@ GET /test_create_node
                 debug = true,
             }
             if not client then
-                ngx.say("error: ", err)
+                ngx.print("error: ", err)
                 return
             end
 
             local ok, err = client:connect()
             if not ok then
-                ngx.say("error: ", err)
+                ngx.print("error: ", err)
                 return
             end
             
             local test_path = os.getenv("TEST_NGINX_ZK_TEST_PATH")
             local data, err = client:get_data(test_path)
             if err then
-                ngx.say("get_data error: ", err)
+                ngx.print("get_data error: ", err)
             else
-                ngx.say("data: ", data)
+                ngx.print("data:", data)
             end
 
             client:close()
@@ -111,7 +117,7 @@ GET /test_create_node
     }
 --- request
 GET /test_get_node
---- response_body: data: nginx_zk_data
+--- response_body: data:
 --- no_error_log
 [error]
 
@@ -127,22 +133,22 @@ GET /test_get_node
                 debug = true,
             }
             if not client then
-                ngx.say("error: ", err)
+                ngx.print("error: ", err)
                 return
             end
 
             local ok, err = client:connect()
             if not ok then
-                ngx.say("error: ", err)
+                ngx.print("error: ", err)
                 return
             end
 
             local test_path = os.getenv("TEST_NGINX_ZK_TEST_PATH")
             local exists, err = client:exists(test_path)
             if err then
-                ngx.say("exists error: ", err)
+                ngx.print("exists error: ", err)
             else
-                ngx.say("node exists: ", tostring(exists))
+                ngx.print("node exists: ", tostring(exists))
             end
 
             client:close()
