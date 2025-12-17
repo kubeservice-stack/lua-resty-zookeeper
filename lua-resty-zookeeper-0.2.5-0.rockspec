@@ -1,8 +1,8 @@
 package = "lua-resty-zookeeper"
-version = "master"
+version = "0.2.5-0"
 source = {
-  url = "git://github.com/kubeservice-stack/lua-resty-zookeeper",
-  tag = "master"
+  url = "git+https://github.com/kubeservice-stack/lua-resty-zookeeper.git",
+  tag = "v0.2.5"
 }
 description = {
   summary = "Minimal ZooKeeper client for OpenResty / ngx_lua (example)",
@@ -12,9 +12,12 @@ description = {
 }
 dependencies = {
   "lua >= 5.1",
-  "luasocket = 3.1.0-1",
+  "luasocket >= 3.0"
   -- optional runtime deps: luasocket for plain-lua test
 }
 build = {
-  type = "none",
+  type = "builtin",
+    modules = {
+        ["resty.zookeeper"] = "lib/resty/zookeeper.lua",
+    },
 }
