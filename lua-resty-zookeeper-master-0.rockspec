@@ -1,7 +1,7 @@
 package = "lua-resty-zookeeper"
 version = "master"
 source = {
-  url = "git://github.com/kubeservice-stack/lua-resty-zookeeper",
+  url = "git+https://github.com/kubeservice-stack/lua-resty-zookeeper.git",
   tag = "master"
 }
 description = {
@@ -12,9 +12,12 @@ description = {
 }
 dependencies = {
   "lua >= 5.1",
-  "luasocket = 3.1.0-1",
+  "luasocket >= 3.0"
   -- optional runtime deps: luasocket for plain-lua test
 }
 build = {
-  type = "none",
+  type = "builtin",
+    modules = {
+        ["resty.zookeeper"] = "lib/resty/zookeeper.lua",
+    },
 }
