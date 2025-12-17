@@ -98,7 +98,9 @@ end
 local function deserialize_string(s, offset)
     offset = offset or 1
     local len, err = be_to_uint32(s, offset)
-    if not len then return nil, offset, "failed read string length: " .. (err or "") end
+    if not len then 
+        return nil, offset, "failed read string length: " .. (err or "")
+    end
     local start_pos = offset + 4
     local end_pos = start_pos + len - 1
     if #s < end_pos then
@@ -255,9 +257,9 @@ local function deserialize_connect_response(payload)
         if #user_payload >= 8 then
             local up_sid_hi, up_sid_lo = be_to_uint64_parts(user_payload, 1)
             sid_hi, sid_lo = up_sid_hi, up_sid_lo
-            local r3, e3 = attempt_passwd_then_timeout(1)
+            local r3, _ = attempt_passwd_then_timeout(1)
             if r3 then return r3, nil end
-            local r4, e4 = attempt_timeout_then_passwd(1)
+            local r4, _ = attempt_timeout_then_passwd(1)
             if r4 then return r4, nil end
             sid_hi, sid_lo = be_to_uint64_parts(payload, 1)
         end
@@ -536,7 +538,7 @@ function _M.get_data(self, path)
         end
         return nil, "zk error code: " .. tostring(res.err)
     end
-    local data, off, derr = deserialize_string(res.payload, 1)
+    local data, _, derr = deserialize_string(res.payload, 1)
     if data == nil then return nil, "failed parse data: " .. (derr or "unknown") end
     return data, nil
 end
@@ -578,7 +580,7 @@ function _M.create(self, path, data, mode, sequential)
         return nil, "zk error code: " .. tostring(res.err)
     end
     -- payload contains created path (string)
-    local created, off, derr = deserialize_string(res.payload, 1)
+    local created, _, derr = deserialize_string(res.payload, 1)
     if created == nil then
         return nil, "failed parse created path: " .. (derr or "unknown")
     end
