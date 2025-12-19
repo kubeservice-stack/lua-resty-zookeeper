@@ -1,5 +1,5 @@
 -- Minimal ZooKeeper client for OpenResty / ngx_lua
--- Provides: new, set_timeout, connect, add_auth, exists, get_data, close
+-- Provides: new, set_timeout, connect, add_auth, exists, get_data, get_children, close
 -- Notes:
 --  - This implementation focuses on correct CONNECT handshake and basic
 --    request/response framing for common operations.
@@ -15,20 +15,8 @@
 local ngx = ngx
 local socket = ngx and ngx.socket or require("socket") -- fallback for plain Lua (luasocket)
 
--- safe cjson loading with fallback stub
-local cjson_ok, cjson = pcall(require, "cjson.safe")
-if not cjson_ok then
-    cjson_ok, cjson = pcall(require, "cjson")
-end
-if not cjson_ok or not cjson then
-    cjson = {
-        encode = function(_) return nil, "cjson not available" end,
-        decode = function(_) return nil, "cjson not available" end,
-    }
-end
-
 local _M = {
-    _VERSION = "0.2.5",
+    _VERSION = "0.2.6",
     ZOO_OPEN_ACL_UNSAFE = { { perms = 0x1f, scheme = "world", id = "anyone" } },
 }
 
@@ -51,6 +39,14 @@ local SESSION_STATES = {
     DISCONNECTED = 0,
     CONNECTED = 1,
     EXPIRED = 2,
+}
+
+local ZK_ERRORS = {
+    ZOK = 0,
+    ZNONODE = -101,
+    ZNODEEXISTS = -110,
+    ZNOAUTH = -102,
+    ZBADVERSION = -103,
 }
 
 -- Utilities: big-endian pack/unpack (pure Lua)
@@ -98,7 +94,7 @@ end
 local function deserialize_string(s, offset)
     offset = offset or 1
     local len, err = be_to_uint32(s, offset)
-    if not len then 
+    if not len then
         return nil, offset, "failed read string length: " .. (err or "")
     end
     local start_pos = offset + 4
@@ -171,7 +167,11 @@ end
 -- Robust connect response parsing with scanning heuristics
 local function deserialize_connect_response(payload)
     if not payload or #payload < 8 then
-        return nil, "connect response too short (need >=8 for sessionId), got length=" .. tostring(#payload)
+        local err_msg = string.format(
+            "connect response too short (need >=8 for sessionId), got length=%d",
+            #payload
+        )
+        return nil, err_msg
     end
 
     -- Attempt 1: assume payload starts with sessionId
@@ -187,7 +187,11 @@ local function deserialize_connect_response(payload)
         local passwd_start = passwd_len_off + 4
         local passwd_end = passwd_start + passwd_len - 1
         if #payload < passwd_end + 4 then
-            return nil, string.format("not enough bytes for passwd (need %d, have %d) and timeout", passwd_len, #payload - (passwd_start - 1))
+            return nil, string.format(
+                "not enough bytes for passwd (need %d, have %d) and timeout",
+                passwd_len,
+                #payload - (passwd_start - 1)
+            )
         end
         local passwd = passwd_len > 0 and payload:sub(passwd_start, passwd_end) or ""
         local timeout = be_to_uint32(payload, passwd_end + 1)
@@ -210,7 +214,10 @@ local function deserialize_connect_response(payload)
             return nil, "not enough bytes to contain timeout + passwd length"
         end
         local timeout = be_to_uint32(payload, timeout_off)
-        if not timeout then return nil, "failed read timeout at offset " .. tostring(timeout_off) end
+        if not timeout then
+            local err_msg = string.format("failed read timeout at offset %d", timeout_off)
+            return nil, err_msg
+        end
         local passwd_len_off = timeout_off + 4
         if #payload < passwd_len_off + 3 then
             if #payload == passwd_len_off - 1 then
@@ -231,7 +238,11 @@ local function deserialize_connect_response(payload)
         local passwd_start = passwd_len_off + 4
         local passwd_end = passwd_start + passwd_len - 1
         if #payload < passwd_end then
-            return nil, string.format("not enough bytes for passwd (need %d, have %d)", passwd_len, #payload - (passwd_start - 1))
+            return nil, string.format(
+                "not enough bytes for passwd (need %d, have %d)",
+                passwd_len,
+                #payload - (passwd_start - 1)
+            )
         end
         local passwd = passwd_len > 0 and payload:sub(passwd_start, passwd_end) or ""
         local numeric = sid_hi * 4294967296 + sid_lo
@@ -251,7 +262,8 @@ local function deserialize_connect_response(payload)
     local res2, err2 = attempt_timeout_then_passwd(1)
     if res2 then return res2, nil end
 
-    -- If payload may be wrapped (e.g. normal response header present), try user-payload at offset 17
+    -- If payload may be wrapped (e.g. normal response header present),
+    -- try user-payload at offset 17
     if #payload >= 16 then
         local user_payload = payload:sub(17)
         if #user_payload >= 8 then
@@ -296,7 +308,10 @@ local function deserialize_connect_response(payload)
                     local s_hi, s_lo = be_to_uint64_parts(payload, sid_candidate_off)
                     if s_hi and s_lo then
                         local numeric = s_hi * 4294967296 + s_lo
-                        local passwd = possible_len > 0 and payload:sub(passwd_start, passwd_end) or ""
+                        local passwd = ""
+                        if possible_len > 0 then
+                            passwd = payload:sub(passwd_start, passwd_end)
+                        end
                         return {
                             sid_hi = s_hi,
                             sid_lo = s_lo,
@@ -342,7 +357,8 @@ local function send_request(self, opcode, payload)
         if ngx and ngx.log then
             ngx.log(ngx.WARN, "zk: xid mismatch: sent=", xid, " got=", res.xid)
         else
-            io.stderr:write(string.format("zk: xid mismatch: sent=%s got=%s\n", tostring(xid), tostring(res.xid)))
+            local err_msg = string.format("zk: xid mismatch: sent=%s got=%s\n", xid, res.xid)
+            io.stderr:write(err_msg)
         end
     end
     return res, nil
@@ -507,7 +523,7 @@ function _M.add_auth(self, auth_type, creds)
     local payload = serialize_string(auth_type) .. serialize_string(creds)
     local res, err = send_request(self, OP_CODES.AUTH, payload)
     if not res then return nil, err end
-    if res.err ~= 0 then return nil, "auth failed, err=" .. tostring(res.err) end
+    if res.err ~= ZK_ERRORS.ZOK then return nil, "auth failed, err=" .. tostring(res.err) end
     self.auth = { type = auth_type, creds = creds }
     return true, nil
 end
@@ -517,8 +533,8 @@ function _M.exists(self, path)
     local payload = serialize_string(path) .. uint32_to_be(0)
     local res, err = send_request(self, OP_CODES.EXISTS, payload)
     if not res then return nil, err end
-    if res.err ~= 0 then
-        if res.err == -101 then -- ZNONODE
+    if res.err ~= ZK_ERRORS.ZOK then
+        if res.err == ZK_ERRORS.ZNONODE then
             return false, nil
         end
         return nil, "zk error code: " .. tostring(res.err)
@@ -532,8 +548,8 @@ function _M.get_data(self, path)
     local payload = serialize_string(path) .. uint32_to_be(0)
     local res, err = send_request(self, OP_CODES.GET_DATA, payload)
     if not res then return nil, err end
-    if res.err ~= 0 then
-        if res.err == -101 then -- ZNONODE
+    if res.err ~= ZK_ERRORS.ZOK then
+        if res.err == ZK_ERRORS.ZNONODE then
             return nil, "node does not exist"
         end
         return nil, "zk error code: " .. tostring(res.err)
@@ -567,14 +583,21 @@ function _M.create(self, path, data, mode, sequential)
     local acl = self.ZOO_OPEN_ACL_UNSAFE or _M.ZOO_OPEN_ACL_UNSAFE
     local acl_bin = serialize_acl_array(acl)
 
-    local payload = serialize_string(path) .. serialize_string(data) .. acl_bin .. uint32_to_be(flags)
+    local payload_parts = {
+        serialize_string(path),
+        serialize_string(data),
+        acl_bin,
+        uint32_to_be(flags)
+    }
+    local payload = table.concat(payload_parts)
+
     local res, err = send_request(self, OP_CODES.CREATE, payload)
     if not res then return nil, err end
-    if res.err ~= 0 then
-        if res.err == -101 then
+    if res.err ~= ZK_ERRORS.ZOK then
+        if res.err == ZK_ERRORS.ZNONODE then
             return nil, "parent node does not exist"
         end
-        if res.err == -110 then -- ZNODEEXISTS
+        if res.err == ZK_ERRORS.ZNODEEXISTS then
             return nil, "node already exists"
         end
         return nil, "zk error code: " .. tostring(res.err)
@@ -593,8 +616,8 @@ function _M.get_children(self, path)
     local payload = serialize_string(path) .. uint32_to_be(0) -- watch = 0
     local res, err = send_request(self, OP_CODES.GET_CHILDREN, payload)
     if not res then return nil, err end
-    if res.err ~= 0 then
-        if res.err == -101 then -- ZNONODE
+    if res.err ~= ZK_ERRORS.ZOK then
+        if res.err == ZK_ERRORS.ZNONODE then
             return nil, "node does not exist"
         end
         return nil, "zk error code: " .. tostring(res.err)
