@@ -16,3 +16,9 @@ install: all
 test: all
 	git clone https://github.com/openresty/test-nginx.git || exit 0
 	PATH=$(OPENRESTY_PREFIX)/nginx/sbin:$$PATH TEST_NGINX_NO_NGINX_MANAGER=1 prove -I../test-nginx/lib -r t
+
+### lint:             Lint Lua source code
+.PHONY: lint
+lint:
+	luacheck -q lib
+	lj-releng lib/resty/*.lua
