@@ -1,10 +1,3 @@
--- Simple test script for zookeeper.lua (works with plain Lua + LuaSocket)
--- Usage:
---   lua test/test_zk.lua [connect_string] [test_path]
--- Example:
---   lua test/test_zk.lua 127.0.0.1:2181 /
---
--- Requirements:
 --   - Lua (5.1/5.2/5.3/5.4)
 --   - LuaSocket (`luarocks install luasocket`)
 --   - cjson (optional; module requires cjson.safe. If not present, the client may still work but will error on require)
@@ -103,16 +96,44 @@ local children, err = client:get_children(parent)
 if err then
     print("get_children error for", parent, ":", err)
 else
-    print("children of", parent, ":")
-    for i, name in ipairs(children) do
-        print("  ", i, name)
+    print("children of", parent, ":", table.concat(children, ", "))
+end
+
+-- Example: DELETE the created node (use version = -1 to ignore version)
+if created_path then
+    print("Attempt delete:", created_path)
+    local ok, derr = client:delete(created_path, -1)
+    if not ok then
+        print("delete failed:", derr)
+    else
+        print("delete succeeded for", created_path)
     end
 end
 
--- Clean close
+-- Example: WATCH usage
+-- Note: watch blocks until an event is delivered. For reliable testing, trigger an event
+-- from a separate client or process (e.g., create/delete under the watched path).
+-- Here we demonstrate registering a watch on parent children and then (optionally)
+-- prompting manual / external operations to trigger the event.
+print("Registering children watch for:", parent)
+local success, werr = client:get_children(parent) -- register without watch
+if not success then
+    print("get_children (for watch) failed:", werr)
+else
+    -- register watch via watch() helper (this will block until event arrives)
+    print("Calling client:watch(", parent, ', "get_children") => waiting for event...')
+    local evt, err = client:watch(parent, "get_children")
+    if not evt then
+        print("watch failed:", err)
+    else
+        print("watch event:", "type=", tostring(evt.type), "state=", tostring(evt.state), "path=", tostring(evt.path))
+    end
+end
+
+-- Close
 local ok, cerr = client:close()
 if not ok then
-    print("close returned error:", cerr)
+    print("close failed:", cerr)
 else
     print("connection closed")
 end
