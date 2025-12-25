@@ -1,5 +1,5 @@
 -- Minimal ZooKeeper client for OpenResty / ngx_lua
--- Provides: new, set_timeout, connect, add_auth, exists, get_data, get_children, close
+-- Provides: new, set_timeout, connect, add_auth, exists, get_data, get_children, close, delete, watch
 -- Notes:
 --  - This implementation focuses on correct CONNECT handshake and basic
 --    request/response framing for common operations.
@@ -16,7 +16,7 @@ local ngx = ngx
 local socket = ngx and ngx.socket or require("socket") -- fallback for plain Lua (luasocket)
 
 local _M = {
-    _VERSION = "0.2.6",
+    _VERSION = "0.2.7",
     ZOO_OPEN_ACL_UNSAFE = { { perms = 0x1f, scheme = "world", id = "anyone" } },
 }
 
@@ -636,6 +636,94 @@ function _M.get_children(self, path)
         offset = new_offset
     end
     return children, nil
+end
+
+-- DELETE: delete(path, version)
+-- version: signed int32; -1 means any version (default)
+-- returns true on success
+function _M.delete(self, path, version)
+    if self.session_state ~= SESSION_STATES.CONNECTED then return nil, "not connected" end
+    if not path or type(path) ~= "string" then return nil, "invalid path" end
+    -- default version = -1 (any)
+    local ver = version
+    if ver == nil then ver = -1 end
+    -- payload: path (string) + version (int32)
+    local payload = serialize_string(path) .. uint32_to_be(ver)
+    local res, err = send_request(self, OP_CODES.DELETE, payload)
+    if not res then return nil, err end
+    if res.err ~= ZK_ERRORS.ZOK then
+        if res.err == ZK_ERRORS.ZNONODE then
+            return nil, "node does not exist"
+        end
+        if res.err == ZK_ERRORS.ZBADVERSION then
+            return nil, "bad version"
+        end
+        return nil, "zk error code: " .. tostring(res.err)
+    end
+    return true, nil
+end
+
+-- watch(path, kind) -> sets a watch and waits for the next watcher event for this session
+-- kind: "exists" (default), "get_data", "get_children"
+-- returns event_table { type = <int>, state = <int>, path = "<string>" }, nil on success
+-- Note: this call blocks until an event arrives (or socket error). Because the client is synchronous,
+-- it will spin reading packets until a watcher event (xid == 0xFFFFFFFF) is received.
+function _M.watch(self, path, kind)
+    if self.session_state ~= SESSION_STATES.CONNECTED then return nil, "not connected" end
+    if not path or type(path) ~= "string" then return nil, "invalid path" end
+
+    kind = kind or "exists"
+    local opcode_map = {
+        exists = OP_CODES.EXISTS,
+        get_data = OP_CODES.GET_DATA,
+        get_children = OP_CODES.GET_CHILDREN
+    }
+    local opcode = opcode_map[kind]
+    if not opcode then return nil, "invalid watch kind: " .. tostring(kind) end
+
+    -- send the request with watch flag = 1 to register server-side watcher
+    local payload = serialize_string(path) .. uint32_to_be(1) -- watch = 1
+    local res, err = send_request(self, opcode, payload)
+    if not res then return nil, err end
+    -- Some operations return ZNONODE when node absent; that's still valid for exists-watch (watch set)
+    if res.err ~= ZK_ERRORS.ZOK and res.err ~= ZK_ERRORS.ZNONODE then
+        return nil, "zk error code: " .. tostring(res.err)
+    end
+
+    -- loop-read until watcher event (xid == 0xFFFFFFFF unsigned)
+    while true do
+        local raw_payload, rerr = read_packet(self.sock)
+        if not raw_payload then
+            return nil, "failed receive event: " .. (rerr or "unknown")
+        end
+        local ev_res, derr = deserialize_response(raw_payload)
+        if not ev_res then
+            return nil, "failed parse event: " .. (derr or "unknown")
+        end
+        -- watcher events use xid = -1 => unsigned 4294967295
+        if ev_res.xid == 4294967295 then
+            local off = 1
+            local ev_type_u, e1 = be_to_uint32(ev_res.payload, off)
+            if not ev_type_u then return nil, "failed parse event type: " .. (e1 or "") end
+            off = off + 4
+            local ev_state_u, e2 = be_to_uint32(ev_res.payload, off)
+            if not ev_state_u then return nil, "failed parse event state: " .. (e2 or "") end
+            off = off + 4
+            local ev_path, newoff, e3 = deserialize_string(ev_res.payload, off)
+            if ev_path == nil then
+                -- path could be empty string
+                ev_path = ""
+            end
+            local ev_type = to_signed32(ev_type_u)
+            local ev_state = to_signed32(ev_state_u)
+            return { type = ev_type, state = ev_state, path = ev_path }, nil
+        else
+            -- Not a watcher event. Could be other responses (e.g., connection event). Ignore and continue.
+            if ngx and ngx.log then
+                ngx.log(ngx.DEBUG, "zk.watch: ignored non-watcher packet xid=", tostring(ev_res.xid))
+            end
+        end
+    end
 end
 
 function _M.close(self)
